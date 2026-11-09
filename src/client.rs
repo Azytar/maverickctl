@@ -70,6 +70,18 @@ fn negotiate(stream: &mut UnixStream, reader: &mut impl std::io::BufRead) -> io:
     require_protocol(&response)
 }
 
+fn negotiate_v2(stream: &mut UnixStream, reader: &mut impl std::io::BufRead) -> io::Result<()> {
+    stream.write_all(b"protocol 2\n")?;
+    let response = maverick_protocol::protocol::read_frame(reader)?.unwrap_or_default();
+    if response == "protocol 2" {
+        return Ok(());
+    }
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        format!("control protocol v2 unavailable: received {response:?}"),
+    ))
+}
+
 fn require_protocol(response: &str) -> io::Result<()> {
     let expected = format!("protocol {}", maverick_protocol::protocol::PROTOCOL_VERSION);
     if response == expected {
@@ -128,6 +140,35 @@ pub fn dispatch(name: &str, action: &str) -> std::io::Result<String> {
         ));
     }
     send_command(name, &format!("{DISPATCH_CMD} {action}"))
+}
+
+/// Execute a protocol-v2 correlated operation and return the WM-thread result.
+///
+/// This is intentionally separate from `dispatch`: v1 callers keep receipt-only
+/// semantics, while v2 callers get an explicit semantic execution result.
+pub fn operate(name: &str, request_id: u64, action: &str) -> std::io::Result<String> {
+    if action.contains(['\n', '\r']) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "action contains newline",
+        ));
+    }
+    let command = format!("operate {request_id} {action}");
+    if command.len() > MAX_CMD_LEN {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "command too long"));
+    }
+    let path = identity::try_sock_path(name)?;
+    let mut stream = UnixStream::connect(&path)?;
+    stream.set_read_timeout(Some(Duration::from_secs(3))).ok();
+    stream.set_write_timeout(Some(Duration::from_secs(2))).ok();
+    let mut reader = BufReader::new(stream.try_clone()?);
+    negotiate_v2(&mut stream, &mut reader)?;
+    stream.write_all(format!("{command}\n").as_bytes())?;
+    let reply = maverick_protocol::protocol::read_frame(&mut reader)?.unwrap_or_default();
+    if reply.is_empty() {
+        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "no operation result"));
+    }
+    Ok(reply)
 }
 
 /// Run a structured `query <topic>` against a running instance ("workspaces",
