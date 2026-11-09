@@ -415,9 +415,8 @@ mod tests {
                     {
                         assert_eq!(request_id, 42);
                         assert_eq!(action, "focus-left");
-                        let _ = reply.send(
-                            "{\"request_id\":42,\"status\":\"executed\"}".to_string(),
-                        );
+                        let _ =
+                            reply.send("{\"request_id\":42,\"status\":\"executed\"}".to_string());
                         return;
                     }
                 }
