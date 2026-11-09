@@ -238,7 +238,7 @@ where
 mod tests {
     use super::*;
     use maverick_protocol::control::{identity_json, ControlServer, MAX_SUBSCRIBERS};
-    use maverick_protocol::hub::{ControlCommand, ControlHub};
+    use maverick_protocol::hub::{ControlCommand, ControlHub, CMD_CAP};
     use maverick_protocol::identity::{self, InstanceInfo};
 
     #[test]
@@ -383,6 +383,82 @@ mod tests {
         server.shutdown();
         crate::test_support::retire(name);
         assert!(!identity::sock_path(name).exists());
+    }
+
+    #[test]
+    fn protocol_v2_operation_returns_correlated_wm_result() {
+        let name = "testop";
+        crate::test_support::runtime_root();
+        let info = InstanceInfo {
+            name: name.into(),
+            session_id: name.into(),
+            pid: std::process::id(),
+            display: ":9".into(),
+            tty_nr: 0,
+            x_server_identity: "?".into(),
+            start_time: 0,
+            exe: String::new(),
+            started_at: 1,
+            alive: true,
+        };
+        let hub = ControlHub::new();
+        let server = ControlServer::spawn(name, identity_json(&info), hub.clone()).expect("server");
+        let worker = std::thread::spawn({
+            let hub = hub.clone();
+            move || loop {
+                for cmd in hub.drain_commands() {
+                    if let ControlCommand::Operation {
+                        request_id,
+                        action,
+                        reply,
+                    } = cmd
+                    {
+                        assert_eq!(request_id, 42);
+                        assert_eq!(action, "focus-left");
+                        let _ = reply.send(
+                            "{\"request_id\":42,\"status\":\"executed\"}".to_string(),
+                        );
+                        return;
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        });
+        let reply = operate(name, 42, "focus-left").expect("v2 operation");
+        assert_eq!(reply, "{\"request_id\":42,\"status\":\"executed\"}");
+        worker.join().expect("worker");
+        server.shutdown();
+        crate::test_support::retire(name);
+    }
+
+    #[test]
+    fn protocol_v2_operation_reports_busy_instead_of_false_success() {
+        let name = "testopbusy";
+        crate::test_support::runtime_root();
+        let info = InstanceInfo {
+            name: name.into(),
+            session_id: name.into(),
+            pid: std::process::id(),
+            display: ":9".into(),
+            tty_nr: 0,
+            x_server_identity: "?".into(),
+            start_time: 0,
+            exe: String::new(),
+            started_at: 1,
+            alive: true,
+        };
+        let hub = ControlHub::new();
+        for _ in 0..CMD_CAP {
+            assert!(hub.push_command(ControlCommand::Dispatch("focus-left".into())));
+        }
+        let server = ControlServer::spawn(name, identity_json(&info), hub.clone()).expect("server");
+        let reply = operate(name, 77, "focus-left").expect("structured rejection");
+        assert_eq!(
+            reply,
+            "{\"request_id\":77,\"status\":\"rejected\",\"error\":\"busy\"}"
+        );
+        server.shutdown();
+        crate::test_support::retire(name);
     }
 
     /// A peer that accepts the connection and then says nothing must not be able
