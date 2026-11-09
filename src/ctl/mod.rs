@@ -172,6 +172,7 @@ pub fn main_with_args(tool: &str, args: Vec<String>) -> ExitCode {
         "state" => cmd_state(tool, rest, true),
         "query" | "q" => cmd_state(tool, rest, false),
         "msg" | "dispatch" | "command" => cmd_msg(tool, rest),
+        "operate" | "op" => cmd_operate(tool, rest),
         "subscribe" | "sub" => cmd_subscribe(tool, rest),
         "quit" => cmd_quit(tool, rest),
         "quit-all" => cmd_quit_all(tool, rest),
@@ -920,6 +921,39 @@ fn cmd_msg(tool: &str, args: &[String]) -> ExitCode {
         },
         Err(e) => {
             eprintln!("{tool}: dispatch failed: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Execute one correlated protocol-v2 action. Unlike `msg`, success means
+/// the WM thread parsed and executed the action, not merely that the queue took it.
+fn cmd_operate(tool: &str, args: &[String]) -> ExitCode {
+    let o = parse_opts_default(args);
+    if o.positional.is_empty() {
+        eprintln!("{tool}: operate requires an action, e.g. `{tool} operate focus-left`");
+        return ExitCode::FAILURE;
+    }
+    let action = o.positional.join(" ");
+    let name = match resolve_target(tool, &o.name, &o.session) {
+        Some(n) => n,
+        None => return ExitCode::FAILURE,
+    };
+    let request_id = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or_else(|_| u64::from(std::process::id()));
+    match client::operate(&name, request_id, &action) {
+        Ok(reply) => {
+            println!("{reply}");
+            if reply.contains("\"status\":\"executed\"") {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            }
+        }
+        Err(e) => {
+            eprintln!("{tool}: operate failed: {e}");
             ExitCode::FAILURE
         }
     }
