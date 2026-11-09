@@ -384,6 +384,9 @@ fn handle_conn(
         Ok(w) => w,
         Err(_) => return,
     };
+    if writer.set_write_timeout(Some(READ_TIMEOUT)).is_err() {
+        return;
+    }
     let _ = stream.set_read_timeout(Some(READ_TIMEOUT));
     let mut reader = BufReader::new(stream);
     loop {
@@ -425,6 +428,13 @@ fn handle_conn(
             break;
         }
 
+        // Dispatch can also request restart/quit. Read-only queries must stay
+        // outside this gate because their replies require the WM to drain.
+        let _receipt = (matches!(cmd, QUIT_CMD | RESTART_CMD)
+            || cmd.strip_prefix(DISPATCH_CMD).is_some_and(|rest| {
+                rest.is_empty() || rest.starts_with(|c: char| c.is_whitespace())
+            }))
+        .then(|| hub.begin_command_reply());
         let response = dispatch_line(cmd, name, identity_json, hub);
         if writer.write_all(response.as_bytes()).is_err() {
             break;
@@ -472,6 +482,9 @@ fn dispatch_line(cmd: &str, name: &str, identity_json: &str, hub: &ControlHub) -
     let restarting = hub.is_restarting();
     match cmd {
         "protocol" => format!("protocol {}\n", crate::protocol::PROTOCOL_VERSION),
+        // Explicit opt-in for the verifiable control extension. Plain
+        // `protocol` remains v1 so existing clients keep their exact contract.
+        "protocol 2" => "protocol 2\n".to_string(),
         PING_CMD if restarting => "error restarting\n".to_string(),
         STATE_CMD if restarting => "error restarting\n".to_string(),
         PING_CMD => format!("pong {safe_name}\n"),
@@ -511,6 +524,43 @@ fn dispatch_line(cmd: &str, name: &str, identity_json: &str, hub: &ControlHub) -
                         return "ok\n".to_string();
                     }
                     return "error busy: command queue full\n".to_string();
+                }
+            }
+            // `operate <request_id> <action>` — protocol-v2 semantic execution.
+            // The socket thread only parses framing/correlation; the action grammar
+            // remains exclusively on the WM thread.
+            if let Some(rest) = tmp.strip_prefix("operate") {
+                if rest.is_empty() || rest.starts_with(|c: char| c.is_whitespace()) {
+                    if restarting {
+                        return "error restarting\n".to_string();
+                    }
+                    let rest = rest.trim();
+                    let Some((id, action)) = rest.split_once(char::is_whitespace) else {
+                        return "error operate: expected request_id and action\n".to_string();
+                    };
+                    let Ok(request_id) = id.parse::<u64>() else {
+                        return "error operate: invalid request_id\n".to_string();
+                    };
+                    let action = action.trim();
+                    if action.is_empty() {
+                        return "error operate: missing action\n".to_string();
+                    }
+                    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+                    if !hub.push_command(ControlCommand::Operation {
+                        request_id,
+                        action: action.to_string(),
+                        reply: tx,
+                    }) {
+                        return format!(
+                            "{{\"request_id\":{request_id},\"status\":\"rejected\",\"error\":\"busy\"}}\n"
+                        );
+                    }
+                    return match rx.recv_timeout(std::time::Duration::from_secs(2)) {
+                        Ok(result) => format!("{}\n", single_line(&result)),
+                        Err(_) => format!(
+                            "{{\"request_id\":{request_id},\"status\":\"timeout\"}}\n"
+                        ),
+                    };
                 }
             }
             // `query <topic>` — same delimiter requirement.
