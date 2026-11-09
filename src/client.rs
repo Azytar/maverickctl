@@ -155,7 +155,10 @@ pub fn operate(name: &str, request_id: u64, action: &str) -> std::io::Result<Str
     }
     let command = format!("operate {request_id} {action}");
     if command.len() > MAX_CMD_LEN {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "command too long"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "command too long",
+        ));
     }
     let path = identity::try_sock_path(name)?;
     let mut stream = UnixStream::connect(&path)?;
@@ -166,7 +169,10 @@ pub fn operate(name: &str, request_id: u64, action: &str) -> std::io::Result<Str
     stream.write_all(format!("{command}\n").as_bytes())?;
     let reply = maverick_protocol::protocol::read_frame(&mut reader)?.unwrap_or_default();
     if reply.is_empty() {
-        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "no operation result"));
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "no operation result",
+        ));
     }
     Ok(reply)
 }
