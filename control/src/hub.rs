@@ -50,7 +50,7 @@ use std::io::{Read, Write};
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 
 /// Maximum queued control commands (server threads → WM thread).
 ///
@@ -82,6 +82,14 @@ pub enum ControlCommand {
     Reload,
     /// Execute a named action, e.g. `focus-left`, `cycle-layout`, `view 3`.
     Dispatch(String),
+    /// Protocol-v2 operation. Unlike `Dispatch`, this carries a correlation id
+    /// and a one-shot reply owned by the WM thread, so the socket server cannot
+    /// confuse queue acceptance with semantic execution.
+    Operation {
+        request_id: u64,
+        action: String,
+        reply: SyncSender<String>,
+    },
     /// A structured read-only query ("workspaces", "tree", "focused", …).
     /// The WM answers by sending the result JSON through `reply`; the server
     /// thread blocks on the channel until it arrives (2 s timeout).
@@ -101,6 +109,8 @@ pub struct ControlHub {
 }
 
 struct Inner {
+    /// Keeps a queued lifecycle command behind its socket acknowledgement.
+    command_reply: Mutex<()>,
     /// Sender half of the bounded command queue (server thread -> WM thread).
     cmd_tx: SyncSender<ControlCommand>,
     /// Receiver half; guarded so `drain()` can be called from the WM thread.
@@ -127,6 +137,18 @@ struct Inner {
     /// miss it, which would leave the client unable to tell "restarted" from
     /// "the old instance never left".
     restarting: AtomicBool,
+}
+
+pub(crate) struct CommandReply<'a> {
+    gate: Option<MutexGuard<'a, ()>>,
+    hub: &'a ControlHub,
+}
+
+impl Drop for CommandReply<'_> {
+    fn drop(&mut self) {
+        drop(self.gate.take());
+        self.hub.notify_commands();
+    }
 }
 
 impl ControlHub {
@@ -158,6 +180,7 @@ impl ControlHub {
             .expect("nonblocking control wake writer");
         ControlHub {
             inner: Arc::new(Inner {
+                command_reply: Mutex::new(()),
                 cmd_tx,
                 cmd_rx: Mutex::new(cmd_rx),
                 wake_read: Mutex::new(wake_read),
@@ -178,12 +201,30 @@ impl ControlHub {
         if self.inner.cmd_tx.try_send(cmd).is_err() {
             return false;
         }
+        self.notify_commands();
+        true
+    }
+
+    /// Hold delivery until the handler has written the receipt. The gate owns
+    /// no mutable data, so recovering a poisoned lock preserves its contract.
+    pub(crate) fn begin_command_reply(&self) -> CommandReply<'_> {
+        let gate = self
+            .inner
+            .command_reply
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        CommandReply {
+            gate: Some(gate),
+            hub: self,
+        }
+    }
+
+    fn notify_commands(&self) {
         // A byte is only a readiness edge; a full nonblocking pipe is already
         // readable and needs no additional notification.
         if let Ok(mut wake) = self.inner.wake_write.lock() {
             let _ = wake.write(&[1u8]);
         }
-        true
     }
 
     /// Raw descriptor included in the WM's `poll(2)` set.
@@ -274,6 +315,13 @@ impl ControlHub {
     pub fn drain_commands(&self) -> Vec<ControlCommand> {
         self.drain_wake();
         let mut out = Vec::new();
+        let _reply = match self.inner.command_reply.try_lock() {
+            Ok(gate) => gate,
+            Err(TryLockError::Poisoned(error)) => error.into_inner(),
+            // The handler re-arms the pipe after releasing the gate. The WM
+            // can keep serving X11 without waiting for socket I/O.
+            Err(TryLockError::WouldBlock) => return out,
+        };
         if let Ok(rx) = self.inner.cmd_rx.lock() {
             while let Ok(cmd) = rx.try_recv() {
                 out.push(cmd);
@@ -331,6 +379,34 @@ impl Default for ControlHub {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_pending_receipt_defers_delivery_without_blocking_the_wm() {
+        use super::*;
+        use std::time::Duration;
+
+        let hub = ControlHub::new();
+        let receipt = hub.begin_command_reply();
+        assert!(hub.push_command(ControlCommand::Restart));
+        let consumer = hub.clone();
+        let (sent, received) = sync_channel(1);
+        let worker = std::thread::spawn(move || sent.send(consumer.drain_commands()).unwrap());
+        let deferred = received.recv_timeout(Duration::from_millis(500));
+        drop(receipt);
+        worker.join().unwrap();
+        assert!(
+            deferred.unwrap().is_empty(),
+            "WM must not wait on socket I/O"
+        );
+        assert!(crate::wait_readable_fds(
+            &[hub.wake_fd()],
+            Some(Duration::from_secs(1))
+        ));
+        assert!(matches!(
+            hub.drain_commands().as_slice(),
+            [ControlCommand::Restart]
+        ));
+    }
+
     use super::*;
 
     #[test]
